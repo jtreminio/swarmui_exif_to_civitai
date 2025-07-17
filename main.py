@@ -4,6 +4,7 @@ import os
 import re
 import hashlib
 from PIL import Image, PngImagePlugin
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class SwarmUIExifToCivitAI:
@@ -28,10 +29,7 @@ class SwarmUIExifToCivitAI:
 
             # Determine output filename
             base, ext = os.path.splitext(file_path)
-            if self.overwrite:
-                output_path = file_path
-            else:
-                output_path = f"{base}_{hash_value}{ext}"
+            output_path = file_path if self.overwrite else f"{base}_{hash_value}{ext}"
 
             # Prepare metadata
             metadata = PngImagePlugin.PngInfo()
@@ -48,12 +46,11 @@ class SwarmUIExifToCivitAI:
         If path is a directory, return all PNG files in it. If it's a file, return a list containing it.
         """
         if os.path.isdir(path):
-            images = []
-            for entry in os.listdir(path):
-                full = os.path.join(path, entry)
-                if os.path.isfile(full) and entry.lower().endswith(".png"):
-                    images.append(full)
-            return images
+            return [
+                os.path.join(path, f)
+                for f in os.listdir(path)
+                if f.lower().endswith(".png")
+            ]
         elif os.path.isfile(path):
             return [path]
         else:
@@ -71,7 +68,10 @@ class SwarmUIExifToCivitAI:
         try:
             exif_json = json.loads(exif_data)
             image_params = exif_json.get("sui_image_params", {})
-            sui_models = exif_json.get("sui_models", {})
+            sui_models = exif_json.get("sui_models", [])
+            if not isinstance(sui_models, list):
+                print("Warning: 'sui_models' is not a list — skipping file.")
+                return None
 
             prompt = self._clean_prompt(image_params.get("prompt", ""))
             neg_prompt = self._clean_prompt(image_params.get("negativeprompt", ""))
@@ -207,16 +207,18 @@ class SwarmUIExifToCivitAI:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Process PNG files: clean EXIF JSON, rewrite metadata, and optionally append MD5 hash or overwrite."
+        description="Clean and rewrite SwarmUI EXIF metadata for CivitAI."
+    )
+    parser.add_argument("input", help="Path to a PNG file or directory of PNGs")
+    parser.add_argument(
+        "--overwrite", "-w", action="store_true", help="Overwrite original files"
     )
     parser.add_argument(
-        "input", help="Path to a PNG file or a directory containing PNG files."
-    )
-    parser.add_argument(
-        "--overwrite",
-        "-w",
-        action="store_true",
-        help="Overwrite original files instead of creating new ones with hash in filename.",
+        "--threads",
+        "-t",
+        type=int,
+        default=4,
+        help="Number of threads to use (default: 4)",
     )
     args = parser.parse_args()
 
@@ -227,8 +229,10 @@ def main():
         print("No files to process.")
         return
 
-    for file_path in files:
-        runner.process_file(file_path)
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = {executor.submit(runner.process_file, f): f for f in files}
+        for future in as_completed(futures):
+            future.result()
 
 
 if __name__ == "__main__":
