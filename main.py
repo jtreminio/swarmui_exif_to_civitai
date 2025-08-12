@@ -1,8 +1,11 @@
 import argparse
+import datetime
 import json
 import os
 import re
 import hashlib
+import shutil
+import math
 from PIL import Image, PngImagePlugin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -62,7 +65,11 @@ class SwarmUIExifToCivitAI:
         text = re.sub(r"embedding:[^,\n]+\.safetensors", "", text)
         text = re.sub(r"<[^>]+>", "", text)
         text = text.replace("\n", " ")
-        return re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"\s+,", ",", text).strip()
+        text = re.sub(r",+,", ", ", text)
+        text = re.sub(r"\s+", " ", text).strip(" ,")
+
+        return text
 
     def _process_exif_json(self, exif_data: str) -> str | None:
         try:
@@ -126,13 +133,13 @@ class SwarmUIExifToCivitAI:
             }
 
             for i, lora in enumerate(loras):
-                metadata.append(f"Lora_{i} Model name: {lora["name"]}.safetensors")
-                metadata.append(f"Lora_{i} Model hash: {lora["hash"]}")
-                metadata.append(f"Lora_{i} Strength model: {lora["weight"]}")
-                hashes[f"lora:{lora["name"]}"] = lora["hash"]
+                metadata.append(f"Lora_{i} Model name: {lora['name']}.safetensors")
+                metadata.append(f"Lora_{i} Model hash: {lora['hash']}")
+                metadata.append(f"Lora_{i} Strength model: {lora['weight']}")
+                hashes[f"lora:{lora['name']}"] = lora["hash"]
 
             for embedding in embeddings:
-                hashes[f"embed:{embedding["name"]}"] = embedding["hash"]
+                hashes[f"embed:{embedding['name']}"] = embedding["hash"]
 
             final_str = f"{prompt}\n" f"Negative prompt: {neg_prompt}\n"
             final_str += ", ".join(metadata) + ", Hashes: " + json.dumps(hashes)
@@ -205,34 +212,94 @@ class SwarmUIExifToCivitAI:
         return codes.get(code, code)
 
 
+def compute_folder_counts(n: int) -> list[int]:
+    """
+    Decide how many folders and how many images per folder.
+
+    Rules:
+    - If n <= 12: one folder.
+    - Max 12 per folder.
+    - Prefer ~10–11 per folder when possible.
+    - Distribute as evenly as possible (sizes differ by at most 1).
+    """
+    if n <= 12:
+        return [n]
+
+    # Start near an average of 11 per folder
+    k = max(2, round(n / 11))
+
+    # Enforce max 12 per folder
+    while math.ceil(n / k) > 12:
+        k += 1
+
+    # Prefer not to go below 10 if we can keep within max
+    while k > 1 and math.ceil(n / (k - 1)) <= 12 and math.floor(n / (k - 1)) >= 10:
+        k -= 1
+
+    base = n // k
+    rem = n % k
+    # Result: first `rem` folders get base+1, the rest get base
+    counts = [base + 1] * rem + [base] * (k - rem)
+    return counts
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Clean and rewrite SwarmUI EXIF metadata for CivitAI."
     )
-    parser.add_argument("input", help="Path to a PNG file or directory of PNGs")
     parser.add_argument(
-        "--overwrite", "-w", action="store_true", help="Overwrite original files"
+        "--input",
+        default="nonversioned",
     )
     parser.add_argument(
         "--threads",
         "-t",
         type=int,
-        default=4,
-        help="Number of threads to use (default: 4)",
+        default=8,
     )
     args = parser.parse_args()
 
-    runner = SwarmUIExifToCivitAI(overwrite=args.overwrite)
+    runner = SwarmUIExifToCivitAI(overwrite=True)
     files = runner.gather_images(args.input)
 
     if not files:
         print("No files to process.")
         return
 
+    # Deterministic order for moving into batches
+    files.sort()
+
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         futures = {executor.submit(runner.process_file, f): f for f in files}
         for future in as_completed(futures):
             future.result()
+
+    total = len(files)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ready_root = os.path.join(args.input, "../ready/")
+
+    if total <= 12:
+        # Single folder
+        target_dir = os.path.join(ready_root, timestamp)
+        os.makedirs(target_dir, exist_ok=True)
+        for f in files:
+            shutil.move(f, target_dir)
+        print(f"Moved {total} file(s) into: {target_dir}")
+        return
+
+    # Multiple folders: spread evenly, prefer ~10–11, cap at 12
+    counts = compute_folder_counts(total)
+    print(f"Distributing {total} files across {len(counts)} folder(s): {counts}")
+
+    start = 0
+    for idx, count in enumerate(counts, start=1):
+        batch_files = files[start:start + count]
+        start += count
+        batch_dir = os.path.join(ready_root, f"{timestamp}-{idx:02d}")
+        os.makedirs(batch_dir, exist_ok=True)
+        for f in batch_files:
+            shutil.move(f, batch_dir)
+        print(f"Moved {len(batch_files)} file(s) into: {batch_dir}")
 
 
 if __name__ == "__main__":
